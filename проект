@@ -1,0 +1,219 @@
+import asyncio
+import smtplib
+import os
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import (
+    ReplyKeyboardMarkup, 
+    KeyboardButton, 
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultArticle, 
+    InputTextMessageContent
+)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+
+API_TOKEN = '8665204567:AAH4WtWnxRPtODCZ-bocL_eVyZJ5TxjvLw8'
+EMAIL =('savelijstepanuk38@gmail.com')
+EMAIL_PASSWORD = ('89834115108Notegame$')
+
+reminders = {}
+scheduler = AsyncIOScheduler()
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
+
+# Клавиатуры
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Напомнить через 10 минут")],
+        [KeyboardButton(text="Напомнить через 1 час")],
+        [KeyboardButton(text="Отправить на почту")],
+        [KeyboardButton(text="Мои напоминания"), KeyboardButton(text="Удалить все")]
+    ],
+    resize_keyboard=True
+)
+
+# Отправка письма
+async def send_email_tasks(user_email, tasks_list):
+    if not tasks_list:
+        return "Нет активных напоминаний"
+    
+    message = "ВАШИ НАПОМИНАНИЯ\n\n"
+    for i, task in enumerate(tasks_list, 1):
+        message += f"{i}. {task['text']}\n   Время: {task['time'].strftime('%d.%m %H:%M')}\n\n"
+    
+    msg = EmailMessage()
+    msg.set_content(message)
+    msg["Subject"] = "Ваши напоминания"
+    msg["From"] = EMAIL
+    msg["To"] = user_email
+    
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, lambda: _send_sync(msg))
+    return "Отправлено на почту!"
+
+def _send_sync(msg):
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls()
+        server.login(EMAIL, EMAIL_PASSWORD)
+        server.send_message(msg)
+
+# Отправка напоминания
+async def send_reminder(bot: Bot, user_id, text):
+    await bot.send_message(user_id, f"НАПОМИНАНИЕ: {text}")
+
+def add_reminder(user_id, text, seconds):
+    remind_time = datetime.now() + timedelta(seconds=seconds)
+    if user_id not in reminders:
+        reminders[user_id] = []
+    reminders[user_id].append({"text": text, "time": remind_time})
+    return remind_time
+
+# Ежедневное сообщение
+async def daily_message(bot: Bot):
+    for user_id in reminders.keys():
+        await bot.send_message(user_id, "Доброе утро! Запланируйте дела на сегодня.")
+
+# Inline режим
+async def create_inline_reminder(query_text, user_id):
+    parts = query_text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[0].isdigit():
+        return InlineQueryResultArticle(
+            id="0",
+            title="Ошибка формата",
+            input_message_content=InputTextMessageContent(
+                message_text="Пример: @bot 30 Купить хлеб (напомнит через 30 минут)"
+            )
+        )
+    
+    minutes = int(parts[0])
+    text = parts[1]
+    if minutes > 1440:
+        minutes = 1440
+    
+    remind_time = add_reminder(user_id, text, minutes * 60)
+    scheduler.add_job(
+        send_reminder,
+        "date",
+        run_date=remind_time,
+        args=[bot, user_id, text],
+        id=f"{user_id}_{remind_time.timestamp()}"
+    )
+    
+    return InlineQueryResultArticle(
+        id="1",
+        title=f"Напомнить через {minutes} минут",
+        input_message_content=InputTextMessageContent(message_text=f"Напомню через {minutes} минут: {text}")
+    )
+
+# Обработчики
+@dp.message(Command("start"))
+async def start_cmd(message: types.Message):
+    await message.answer(
+        "Бот-напоминалка\n\n"
+        "Функции:\n"
+        "- Напомнить через 10 минут или час\n"
+        "- Отправить список на почту\n"
+        "- Inline режим: @bot 15 Купить молоко\n\n"
+        "Используйте кнопки ниже",
+        reply_markup=main_kb
+    )
+
+@dp.message(F.text == "Напомнить через 10 минут")
+async def remind_10min(message: types.Message):
+    await message.answer("Напишите текст напоминания:")
+    dp["state"] = {"user": message.from_user.id, "action": "remind", "seconds": 600}
+
+@dp.message(F.text == "Напомнить через 1 час")
+async def remind_1hour(message: types.Message):
+    await message.answer("Напишите текст напоминания:")
+    dp["state"] = {"user": message.from_user.id, "action": "remind", "seconds": 3600}
+
+@dp.message(F.text == "Мои напоминания")
+async def list_reminders(message: types.Message):
+    user_reminders = reminders.get(message.from_user.id, [])
+    if not user_reminders:
+        await message.answer("Нет активных напоминаний")
+        return
+    
+    text = "Ваши напоминания:\n\n"
+    for i, r in enumerate(user_reminders):
+        text += f"{i+1}. {r['text']}\n   до {r['time'].strftime('%d.%m %H:%M')}\n\n"
+    await message.answer(text)
+
+@dp.message(F.text == "Отправить на почту")
+async def ask_email(message: types.Message):
+    await message.answer("Введите ваш email:")
+    dp["state"] = {"user": message.from_user.id, "action": "waiting_email"}
+
+@dp.message(F.text == "Удалить все")
+async def delete_all(message: types.Message):
+    if message.from_user.id in reminders:
+        for r in reminders[message.from_user.id]:
+            job_id = f"{message.from_user.id}_{r['time'].timestamp()}"
+            try:
+                scheduler.remove_job(job_id)
+            except:
+                pass
+        reminders[message.from_user.id] = []
+    await message.answer("Все напоминания удалены", reply_markup=main_kb)
+
+@dp.message()
+async def handle_text(message: types.Message):
+    if hasattr(dp, "state") and dp.state.get("user") == message.from_user.id:
+        if dp.state.get("action") == "remind":
+            text = message.text
+            seconds = dp.state["seconds"]
+            remind_time = add_reminder(message.from_user.id, text, seconds)
+            scheduler.add_job(
+                send_reminder,
+                "date",
+                run_date=remind_time,
+                args=[bot, message.from_user.id, text],
+                id=f"{message.from_user.id}_{remind_time.timestamp()}"
+            )
+            await message.answer(f"Напомню через {seconds//60} минут: {text}", reply_markup=main_kb)
+            dp.state = {}
+        
+        elif dp.state.get("action") == "waiting_email":
+            email = message.text.strip()
+            if "@" in email and "." in email:
+                user_reminders = reminders.get(message.from_user.id, [])
+                result = await send_email_tasks(email, user_reminders)
+                await message.answer(result, reply_markup=main_kb)
+            else:
+                await message.answer("Неверный email. Попробуйте ещё:")
+                return
+            dp.state = {}
+
+@dp.inline_query()
+async def inline_handler(query: types.InlineQuery):
+    if not query.query:
+        results = [InlineQueryResultArticle(
+            id="help",
+            title="Быстрое напоминание",
+            input_message_content=InputTextMessageContent(message_text="Пример: @bot 30 Позвонить маме")
+        )]
+        await query.answer(results, cache_time=1)
+        return
+    
+    result = await create_inline_reminder(query.query, query.from_user.id)
+    await query.answer([result], cache_time=1)
+
+@dp.startup()
+async def on_startup():
+    scheduler.add_job(daily_message, "cron", hour=9, minute=0, args=[bot])
+    scheduler.start()
+    print("Бот запущен")
+    print("Расписание: ежедневно в 9:00")
+    print("Inline режим активен")
+
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+asyncio.run(main())
